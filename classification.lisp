@@ -13,7 +13,8 @@
                   :str
                   :lquery
                   :pomo-elver
-                  :parse-float)))
+                  :parse-float
+                  :draw-cons-tree)))
 
 (defpackage classification
   (:use :common-lisp
@@ -32,7 +33,9 @@
                 :current-version
                 :initial-migration
                 :apply-migration
-                :apply-all-migrations))
+                :apply-all-migrations)
+  (:import-from :draw-cons-tree
+                :draw-tree))
 
 (in-package classification)
 
@@ -94,6 +97,24 @@
            (list root (second tree) (insert x (third tree))))
           (:else
            (list root (insert x (second tree)) (third tree))))))
+
+(defun insert* (item tree &key (compare-fn #'<) (equal-fn #'eq))
+  "Return a new binary tree, with ITEM inserted using COMPARE-FN.
+COMPARE-FN should return :EQ if items are equal, or :LT or GT according to
+the comparison method"
+  (let ((root (car tree)))
+    (cond ((null root)
+           (list item nil))
+          ((funcall equal-fn item root)
+           t)
+          ((funcall compare-fn item root)
+           (list root
+                 (second tree)
+                 (insert* item (third tree) :compare-fn compare-fn :equal-fn equal-fn)))
+          (:else
+           (list root
+                 (insert* item (second tree) :compare-fn compare-fn :equal-fn equal-fn)
+                 (third tree))))))
 
 ;;;
 ;;; Scrape the Austronesian basic vocabulary database
@@ -237,13 +258,6 @@ the cognacy entries are in the European format, with , as the decimal char"
   (dao-table-definition 'lexeme))
 
 ;;;
-;;; Convenience methods for working with the DAO objects
-;;;
-
-(defgeneric language-lexemes (language)
-  (:documentation ""))
-
-;;;
 ;;; Routine to convert XML from ABVD into DAO objects and populate database
 ;;;
 
@@ -288,6 +302,11 @@ the cognacy entries are in the European format, with , as the decimal char"
                                                                    (gloss-id gloss))
                                                              (get-fields rec lexeme-fields))))))))
                       (format t "Finished processing ~a (~a)~&" (language-name lang) path))
-                  (cl-postgres-error:admin-shutdown (c)
+                  (error (c)
                     (format t "Couldn't process ~a: Error ~s~&" path c))))))))
 
+;;;
+;;;
+;;;
+
+                  
