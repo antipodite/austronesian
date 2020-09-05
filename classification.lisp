@@ -163,11 +163,7 @@ and save to DIRECTORY. Possible TYPEs are csv, tdf, xml"
 (defun make-language (lang auth sil glotto notes probs classif typed checked src lat lng)
   "Constructor for LANGUAGE class."
   (flet ((double/db-null (string)
-<<<<<<< HEAD
-           (handler-case
-=======
            (handler-case ; For some reason lxml very occasionally turns lat/lng to an int...
->>>>>>> bloods
                (if-let float (parse-float string :type 'double-float :junk-allowed t)
                        float
                        :null)
@@ -240,65 +236,14 @@ the cognacy entries are in the European format, with , as the decimal char"
   (dao-table-definition 'gloss)
   (dao-table-definition 'lexeme))
 
-;;; These methods let us treat the database access classes like normal objects.
-;;; The DAO classes are set up so data is normalised, but we want to be able
-;;; to easily get e.g. the English gloss text for a lexeme without having to
-;;; run another query.
+;;;
+;;; Convenience methods for working with the DAO objects
+;;;
 
-(defgeneric lexeme-language (lexeme &rest args)
-  (:documentation "Get the name of the language associated with this lexeme"))
-
-(defmethod lexeme-language ((lexeme lexeme) &key (init nil))
-  (when (null (slot-value lexeme 'language-name))
-    (setf (slot-value lexeme 'language-name)
-          (with-connection *db-parameters*
-            (language-name (get-dao 'language
-                                    (lexeme-language-id lexeme))))))
-  (unless init ; Suppress output 
-    (slot-value lexeme 'language-name)))
-
-(defmethod initialize-instance :after ((lexeme lexeme) &key)
-  (handler-case
-      (lexeme-language lexeme :init t)
-    ;; The instance has been created but not inserted, so doesn't
-    ;; make sense to query-populate the other slots:
-    (unbound-slot () nil))) 
-           
-
-(defgeneric lexeme-gloss (lexeme &rest args)
-  (:documentation "Get the English gloss associated with this lexeme"))
-
-(defmethod lexeme-gloss ((lexeme lexeme) &key (init nil))
-  (when (null (slot-value lexeme 'gloss-name))
-    (setf (slot-value lexeme 'gloss-name)
-          (with-connection *db-parameters*
-            (gloss-name (get-dao 'gloss (lexeme-gloss-id lexeme))))))
-  (unless init
-    (slot-value lexeme 'gloss-name)))
-
-(defmethod initialize-instance :after ((lexeme lexeme) &key)
-  (handler-case
-      (lexeme-language lexeme :init t)
-    ;; The instance has been created but not inserted, so doesn't
-    ;; make sense to query-populate the other slots:
-    (unbound-slot () nil))) 
-
-
-(defgeneric language-lexemes (language &rest args)
-  (:documentation "Get a list of all lexemes associated with this language"))
-
-(defmethod language-lexemes ((language language) &key (init nil))
-  "Caches the returned lexemes in a hash table in the LANGUAGE to improve performance"
-  (let ((lex-table (slot-value language 'lexemes)))
-    (when (emptyp lex-table)
-      (with-connection *db-parameters*
-        (do-select-dao (('lexeme lex) (:= 'language-id (language-id language)))
-          (setf (gethash (lexeme-gloss lex) lex-table) lex))))
-    (unless init
-      (hash-table-values (slot-value language 'lexemes)))))
+(defgeneric language-lexemes (language)
+  (:documentation ""))
 
 ;;;
-<<<<<<< HEAD
 ;;; Routine to convert XML from ABVD into DAO objects and populate database
 ;;;
 
@@ -307,15 +252,6 @@ the cognacy entries are in the European format, with , as the decimal char"
     (query (:delete-from 'languages))
     (query (:delete-from 'lexemes))
     (query (:delete-from 'glosses))))
-=======
-;;; Wrapper classes around the DAOs, as the pomo DAO class does not mix well
-;;; with normal class stuff
-;;;
-
-;;;
-;;; Routine to convert XML from ABVD into DAO objects and populate database
-;;;
->>>>>>> bloods
 
 (defun xml-to-database (directory &key (n 2000))
   "Load the XML files from DIRECTORY, extract information, and insert"
@@ -334,60 +270,24 @@ the cognacy entries are in the European format, with , as the decimal char"
              for i below n
              do (handler-case
                     (let* ((xml  (lquery:load-page path))
-                           (lang (apply #'make-language (append (get-fields xml lang-fields)
-                                                                '(:init t))))
+                           (lang (apply #'make-language (get-fields xml lang-fields)))
                            ;; First & second records contain  language info and coords, cut them off
                            (word-recs (slice (lquery:$ xml "record") 2 :end)))
+                      
                       (with-connection *db-parameters*
                         (with-transaction () ; Don't insert anything for this file on error
                           (insert-dao lang)  ; Insert the language data first so we can use its ID
                           (loop
                              for rec across word-recs
-                             do
-                               (let* ((gl-name (car (get-fields rec gloss-fields)))
-                                      ;; Check whether we already have this gloss
-                                      (gloss   (if-let gl (first (select-dao 'gloss (:= 'name gl-name)))
-                                                       gl
-                                                       (insert-dao (make-gloss gl-name))))
-                                      (lex     (insert-dao (apply #'make-lexeme
-                                                                  (append (list (language-id lang)
-                                                                                (gloss-id gloss))
-                                                                          (get-fields rec lexeme-fields)
-                                                                          '(:init t))))))
-                                 (when verbose
-                                   (format t "Inserted ~a (~a) for language ~a~&"
-                                           (lexeme-transcript lex)
-                                           (gloss-name gloss)
-                                           (language-name lang)))))))
-                      (format t "Finished processing language ~a~%" (language-name lang)))
-                  (error (condition)
-                    (format t "Couldn't process ~a: Error ~a was encountered~&" path condition))))))))
+                             do (let* ((gl-name (car (get-fields rec gloss-fields)))
+                                       (gloss   (if (select-dao 'gloss (:= 'name gl-name))
+                                                    (first (select-dao 'gloss (:= 'name gl-name)))
+                                                    (insert-dao (make-gloss gl-name)))))
+                                  (insert-dao (apply #'make-lexeme
+                                                     (append (list (language-id lang)
+                                                                   (gloss-id gloss))
+                                                             (get-fields rec lexeme-fields))))))))
+                      (format t "Finished processing ~a (~a)~&" (language-name lang) path))
+                  (cl-postgres-error:admin-shutdown (c)
+                    (format t "Couldn't process ~a: Error ~s~&" path c))))))))
 
-<<<<<<< HEAD
-=======
-      (loop
-         for path in (uiop:directory-files directory)
-         for i below n
-         do (handler-case
-                (let* ((xml  (lquery:load-page path))
-                       (lang (apply #'make-language (get-fields xml lang-fields)))
-                       ;; First & second records contain  language info and coords, cut them off
-                       (word-recs (slice (lquery:$ xml "record") 2 :end)))
-                  
-                  (with-connection *db-parameters*
-                    (with-transaction () ; Don't insert anything for this file on error
-                      (insert-dao lang)  ; Insert the language data first so we can use its ID
-                      (loop
-                         for rec across word-recs
-                         do (let* ((gl-name (car (get-fields rec gloss-fields)))
-                                   (gloss   (if (select-dao 'gloss (:= 'name gl-name))
-                                                (first (select-dao 'gloss (:= 'name gl-name)))
-                                                (insert-dao (make-gloss gl-name)))))
-                              (insert-dao (apply #'make-lexeme
-                                                 (append (list (language-id lang)
-                                                               (gloss-id gloss))
-                                                         (get-fields rec lexeme-fields))))))))
-                  (format t "Finished processing ~a (~a)~&" (language-name lang) path))
-              (error (c)
-                (format t "Couldn't process ~a: Error ~s~&" path c))))))) 
->>>>>>> bloods
