@@ -24,7 +24,8 @@
                 :curry
                 :rcurry
                 :flatten
-                :hash-table-values)
+                :hash-table-values
+                :make-gensym-list)
   (:import-from :parse-float
                 :parse-float)
   (:import-from :lquery
@@ -223,21 +224,53 @@ and values are list elements."
     (values table (hash-table-count table))))
 
 (defun distance-matrix (languages)
+  "Build a distance matrix of given languages"
   (multiple-value-bind (index count) (list->hash languages)
     (let ((dist-matrix  (make-array (list count count) :initial-element 0))
           (memo-table   (make-hash-table :test #'equal)))
-      (loop
-         for i from 0 below count
-         do (loop
-               for j from 0 below count
-               do (let ((val (gethash (format nil "~a~a" j i) memo-table)))
+
+      (flet ((ints->string (x y)
+               (format nil "~a~a" x y)))
+        
+        (loop for i from 0 below count do
+             (loop for j from 0 below count do
+                ;; Check for previously computed value for this language combo
+                  (let ((val (gethash (ints->string j i) memo-table)))
                     (if val
                         (setf (aref dist-matrix i j) val)
-                        ; Else
+                        ;; Else
                         (let ((lang-dist (language-distance (gethash i index)
                                                             (gethash j index))))
-                          (progn (setf (aref dist-matrix i j) lang-dist)
-                                 (setf (gethash (format nil "~a~a" i j) memo-table) lang-dist)))))))
-      dist-matrix)))
-      
+                          (progn (setf (aref dist-matrix i j)
+                                       lang-dist)
+                                 (setf (gethash (ints->string i j) memo-table)
+                                       lang-dist)))))))
+        (values dist-matrix index)))))
 
+(defun array-slice (arr row)
+    (make-array (array-dimension arr 1) 
+      :displaced-to arr 
+      :displaced-index-offset (* row (array-dimension arr 1))))
+
+(defun vector-min (vec &key (threshold 0))
+  "Return the smallest element in the vector along with the index.
+Ignores values lower than THRESHOLD"
+  (loop
+     for el across vec and i from 0
+     with smallest = (aref vec 0) and index = 0
+     do (when (and (> smallest el) (<= threshold el))
+          (setf smallest el) (setf index i))
+     finally (return (values smallest index))))
+
+(defun matrix-min (matrix &key (threshold 0))
+  "Return the smallest value in a 2D vector along with its indices"
+  (loop
+     for i below (array-dimension matrix 0)
+     with min and min-i and min-j do
+       (loop
+          for j below (array-dimension matrix 1)
+          for el = (aref matrix i j) do
+            (when (and (or (null min) (> min el))
+                       (<= threshold el))
+              (setf min el) (setf min-i i) (setf min-j j)))
+     finally (return (values min (list min-i min-j)))))
