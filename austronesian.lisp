@@ -8,6 +8,7 @@
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (ql:quickload '(:alexandria
+                  :lparallel
                   :dexador
                   :postmodern
                   :str
@@ -21,11 +22,13 @@
   (:use :common-lisp
         :postmodern)
   (:import-from :alexandria
+                :if-let
                 :curry
                 :rcurry
                 :flatten
                 :hash-table-values
-                :make-gensym-list)
+                :make-gensym-list
+                :xor)
   (:import-from :parse-float
                 :parse-float)
   (:import-from :lquery
@@ -56,14 +59,6 @@
                 :element-type (array-element-type vector)
                 :displaced-to vector
                 :displaced-index-offset start)))
-
-(defmacro if-let (var test-expr pass-expr fail-expr)
-  "If, but bind the result of the test to a variable in success expr"
-  (let ((result-val (gensym)))
-    `(let ((,result-val ,test-expr))
-       (if ,result-val
-           ,(subst result-val var pass-expr)
-           ,fail-expr))))
 
 ;;;
 ;;; Basic binary tree
@@ -204,14 +199,17 @@ list 3 times, O(n³) I think...?"
 (defun language-distance (a b)
   "Compute the average edit distance between all equivalent words of 
 languages a and b. Rewritten using loop for more efficiency"
-  (loop
-     for word-a in (lang-words a)
-     for word-b = (lang-word b (word-gloss word-a))
-     with i = 0
-     with total = 0
-     do (when (and word-a word-b) ; Ignore words with no equivalent, cf. Greenhill 2012
-          (incf i) (incf total (word-distance word-a word-b)))
-     finally (return (float (/ total i)))))
+  (handler-case 
+      (loop
+         for word-a in (lang-words a)
+         for word-b = (lang-word b (word-gloss word-a))
+         with i = 0
+         with total = 0
+         do (when (and word-a word-b) ; Ignore words with no equivalent, cf. Greenhill 2012
+              (incf i) (incf total (word-distance word-a word-b)))
+         finally (return (float (/ total i))))
+    (division-by-zero ()
+      0)))
 
 (defun list->hash (list &key (test #'equal))
   "Convert a list to a hash table where keys are list element indices 
@@ -223,29 +221,25 @@ and values are list elements."
        do (setf (gethash i table) item))
     (values table (hash-table-count table))))
 
-(defun distance-matrix (languages)
-  "Build a distance matrix of given languages"
-  (multiple-value-bind (index count) (list->hash languages)
-    (let ((dist-matrix  (make-array (list count count) :initial-element 0))
-          (memo-table   (make-hash-table :test #'equal)))
+(defclass distance-matrix ()
+  ((matrix :type simple-array :initarg :matrix :accessor dm-matrix)
+   (index  :type hash-table   :initarg :index  :accessor dm-index))
+  (:documentation "Store distance matrix itself and the associated
+hash table of language indices in one place"))
 
-      (flet ((ints->string (x y)
-               (format nil "~a~a" x y)))
-        
-        (loop for i from 0 below count do
-             (loop for j from 0 below count do
-                ;; Check for previously computed value for this language combo
-                  (let ((val (gethash (ints->string j i) memo-table)))
-                    (if val
-                        (setf (aref dist-matrix i j) val)
-                        ;; Else
-                        (let ((lang-dist (language-distance (gethash i index)
-                                                            (gethash j index))))
-                          (progn (setf (aref dist-matrix i j)
-                                       lang-dist)
-                                 (setf (gethash (ints->string i j) memo-table)
-                                       lang-dist)))))))
-        (values dist-matrix index)))))
+(defun make-dist-matrix (items compare-fn)
+  "Pretty fast now, does every language in the ABVD in about 110s"
+  (let* ((n       (array-dimension items 0))
+         (matrix  (make-array (list n n))))
+    (dotimes (i n)
+      (lparallel:pdotimes (j n)
+        (setf (aref matrix i j)
+              (if-let (memo (< 0 (aref matrix j i)))
+                      memo
+                      (funcall compare-fn
+                               (aref items i) (aref items j))))))
+    (make-instance 'distance-matrix :index items :matrix matrix)))
+
 
 (defun array-slice (arr row)
     (make-array (array-dimension arr 1) 
@@ -262,15 +256,17 @@ Ignores values lower than THRESHOLD"
           (setf smallest el) (setf index i))
      finally (return (values smallest index))))
 
-(defun matrix-min (matrix &key (threshold 0))
+(defun matrix-min (matrix &key (threshold 0) (x-pad 0) (y-pad 0))
   "Return the smallest value in a 2D vector along with its indices"
   (loop
-     for i below (array-dimension matrix 0)
+     for i from x-pad below (array-dimension matrix 0)
      with min and min-i and min-j do
        (loop
-          for j below (array-dimension matrix 1)
+          for j from y-pad below (array-dimension matrix 1)
           for el = (aref matrix i j) do
             (when (and (or (null min) (> min el))
                        (<= threshold el))
               (setf min el) (setf min-i i) (setf min-j j)))
      finally (return (values min (list min-i min-j)))))
+           
+         
