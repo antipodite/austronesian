@@ -47,56 +47,7 @@
 
 (in-package :austronesian)
 
-;;;
-;;; A couple of utilities
-;;;
-
-(defun slice (vector start end)
-  (let ((end (if (eq end :end)
-                 (length vector)
-                 end)))
-    (make-array (- end start)
-                :element-type (array-element-type vector)
-                :displaced-to vector
-                :displaced-index-offset start)))
-
-;;;
-;;; Basic binary tree
-;;;
-
-(defparameter *test-tree*
-  `(8 (10 (14 (13)))
-      (3 (6 (7)
-            (4))
-         (1))))
-
-(defun traverse (tree)
-  (if (atom tree)
-      tree
-      (cons (traverse (car tree))
-            (traverse (cdr tree)))))
-
-(defun binsearch (x tree)
-  (let ((root (car tree)))
-    (cond ((null root)
-           nil)
-          ((= x root)
-           t)
-          ((< x root)
-           (binsearch x (third tree)))
-          (:else
-           (binsearch x (second tree))))))
-
-(defun insert (tree item)
-  (let ((root (car tree)))
-    (cond ((null root)
-           (list item nil))
-          ((= item root)
-           t) ; Element already exists in tree
-          ((< item root)
-           (list root (second tree) (insert item (third tree))))
-          (:else
-           (list root (insert item (second tree)) (third tree))))))
+(setf lparallel:*kernel* (lparallel:make-kernel 8))
 
 ;;;
 ;;; Scrape the Austronesian basic vocabulary database
@@ -122,12 +73,16 @@ and save to DIRECTORY. Possible TYPEs are csv, tdf, xml"
 (defparameter *db-parameters* '("abvd" "isaac" "" "localhost"))
 
 (defclass language ()
-  ((name :type 'string :initarg :name)
+  ((name :type 'string :initarg :name :reader lang-name)
    (words :type 'cons :initarg :words))
   (:documentation "Represents a language in the ABVD.
 Constructors should retrieve the relevant info from the database.
 All word objects for the language are stored in a hash table indexed
 by the English gloss for that word for easy lookup."))
+
+(defmethod print-object ((language language) stream)
+  (print-unreadable-object (language stream :type t)
+    (format stream "~s" (lang-name language))))
 
 (defun make-language (name words)
   (let ((words-hash (make-hash-table :test 'equal)))
@@ -164,37 +119,31 @@ by the English gloss for that word for easy lookup."))
   "Calculate Levenshtein distance between two words as strings."
   (distance (word-string word-a) (word-string word-b)))
 
-(defun get-languages (filter-expr)
-  "Return language objects constructed from database rows.
+(defun get-languages (&optional (filter-expr nil) (params *db-parameters*))
+  "Return an array of language objects constructed from database rows.
 FILTER-EXPR should be an S-SQL :where clause - if nil, returns all
 languages."
   (let* ((filter-expr (if (null filter-expr) t filter-expr))
-         (rows (query (sql-compile (append '(:select 'id 'language :from 'languages)
-                                           `(:where ,filter-expr))))))
-    (mapcar (lambda (row)
-              (make-language (second row)
-                             (mapcar (lambda (it) (apply #'make-word it))
-                                     (query (:select 'glosses.name 'lexemes.transcript
-                                             :from 'lexemes
-                                             :inner-join 'glosses :on (:= 'glosses.id
-                                                                          'lexemes.gloss-id)
-                                             :inner-join 'languages :on (:= 'lexemes.language-id
-                                                                            'languages.id)
-                                             :where (:= 'languages.id
-                                                        (first row)))))))
-            rows)))
-
-
-
-(defun language-difference* (lang-a lang-b)
-  "Compute the average edit distance between all equivalent words of 
-languages a and b. Horribly inefficient because it has to traverse the
-list 3 times, O(n³) I think...?"
-  (let ((distances (mapcar (lambda (w)
-                             (word-distance w (lang-word lang-b (word-gloss w))))
-                           (lang-words lang-a))))
-    (float (/ (reduce #'+ distances)
-              (length distances)))))
+         (rows (with-connection params
+                 (query (sql-compile (append '(:select 'id 'language :from 'languages)
+                                             `(:where ,filter-expr)))))))
+    (flet ((retrieve-words (language-id)
+             (query (:select 'glosses.name 'lexemes.transcript
+                             :from 'lexemes
+                             :inner-join 'glosses :on (:= 'glosses.id
+                                                          'lexemes.gloss-id)
+                             :inner-join 'languages :on (:= 'lexemes.language-id
+                                                            'languages.id)
+                             :where (:= 'languages.id
+                                        language-id)))))
+    (lparallel:pmap 'vector
+                    (lambda (row)
+                      (destructuring-bind (lang-id lang-name) row
+                        (make-language lang-name
+                                       (mapcar (lambda (word-row) (apply #'make-word word-row))
+                                               (with-connection params
+                                                 (retrieve-words lang-id))))))
+                    rows))))
 
 (defun language-distance (a b)
   "Compute the average edit distance between all equivalent words of 
@@ -211,16 +160,6 @@ languages a and b. Rewritten using loop for more efficiency"
     (division-by-zero ()
       0)))
 
-(defun list->hash (list &key (test #'equal))
-  "Convert a list to a hash table where keys are list element indices 
-and values are list elements."
-  (let* ((table (make-hash-table :test test)))
-    (loop
-       for item in list
-       for i from 0
-       do (setf (gethash i table) item))
-    (values table (hash-table-count table))))
-
 (defclass distance-matrix ()
   ((matrix :type simple-array :initarg :matrix :accessor dm-matrix)
    (index  :type hash-table   :initarg :index  :accessor dm-index))
@@ -234,27 +173,62 @@ hash table of language indices in one place"))
     (dotimes (i n)
       (lparallel:pdotimes (j n)
         (setf (aref matrix i j)
-              (if-let (memo (< 0 (aref matrix j i)))
-                      memo
-                      (funcall compare-fn
-                               (aref items i) (aref items j))))))
+              (let ((memo (aref matrix j i)))
+                (if (> memo 0)
+                    memo
+                    (funcall compare-fn
+                             (aref items i) (aref items j)))))))
     (make-instance 'distance-matrix :index items :matrix matrix)))
 
+(defun vector->hash (vector &key (test #'=))
+  "Convert a vector to a hash table with array positions as keys
+and contents as values."
+  (let ((hash (make-hash-table :test test)))
+    (loop
+       for i below (array-dimension vector 0)
+       for el = (aref vector i)
+       do (setf (gethash i hash) el))
+    hash))
 
-(defun array-slice (arr row)
-    (make-array (array-dimension arr 1) 
-      :displaced-to arr 
-      :displaced-index-offset (* row (array-dimension arr 1))))
+(defun cluster (dm)
+  "Cluster a DISTANCE-MATRIX using the unweighted pair group algorithm.
+Languages with no words or no words that match words for other languages
+should be removed from the input data before the DISTANCE-MATRIX is created,
+or it will fail.
+Rather than resizing the matrix to remove rows/columns for clusterswhen a 
+new cluster is created, the matrix is placed in the matrix position for the 
+left-hand cluster, and all the positions for the right-hand cluster are zeroed
+so MATRIX-MIN will ignore them."
+  (let ((cluster-indices (vector->hash (dm-index dm)))
+        (matrix          (alexandria:copy-array (dm-matrix dm))))
 
-(defun vector-min (vec &key (threshold 0))
-  "Return the smallest element in the vector along with the index.
-Ignores values lower than THRESHOLD"
-  (loop
-     for el across vec and i from 0
-     with smallest = (aref vec 0) and index = 0
-     do (when (and (> smallest el) (<= threshold el))
-          (setf smallest el) (setf index i))
-     finally (return (values smallest index))))
+    (flet ((update-matrix (x y)
+             (dotimes (i (array-dimension matrix 0))
+               (when  (/= i x y)
+                 (let ((avg-distance (/ (+ (aref matrix x i)
+                                           (aref matrix y i))
+                                        2.0)))
+                   (setf (aref matrix i x) avg-distance
+                         (aref matrix x i) avg-distance))))
+             (setq-row matrix y 0)
+             (setq-column matrix y 0)))
+
+      (loop until (= 1 (hash-table-count cluster-indices)) do
+           (multiple-value-bind (_ x y) (matrix-min matrix :threshold 0.01)
+             (setf (gethash x cluster-indices)
+                   (list (gethash y cluster-indices) (gethash x cluster-indices)))
+             (remhash y cluster-indices)
+             (update-matrix x y)))
+
+      (car (hash-table-values cluster-indices)))))
+
+(defun setq-column (matrix colnum value)
+  (dotimes (i (array-dimension matrix 0))
+    (setf (aref matrix i colnum) value)))
+
+(defun setq-row (matrix rownum value)
+  (dotimes (i (array-dimension matrix 1))
+    (setf (aref matrix rownum i) value)))
 
 (defun matrix-min (matrix &key (threshold 0) (x-pad 0) (y-pad 0))
   "Return the smallest value in a 2D vector along with its indices"
@@ -267,6 +241,6 @@ Ignores values lower than THRESHOLD"
             (when (and (or (null min) (> min el))
                        (<= threshold el))
               (setf min el) (setf min-i i) (setf min-j j)))
-     finally (return (values min (list min-i min-j)))))
+     finally (return (values min min-i min-j))))
            
          
