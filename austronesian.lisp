@@ -74,7 +74,8 @@ and save to DIRECTORY. Possible TYPEs are csv, tdf, xml"
 
 (defclass language ()
   ((name :type 'string :initarg :name :reader lang-name)
-   (words :type 'cons :initarg :words))
+   (words :type 'cons :initarg :words)
+   (family :type 'list :initarg :family :reader lang-family))
   (:documentation "Represents a language in the ABVD.
 Constructors should retrieve the relevant info from the database.
 All word objects for the language are stored in a hash table indexed
@@ -84,26 +85,40 @@ by the English gloss for that word for easy lookup."))
   (print-unreadable-object (language stream :type t)
     (format stream "~s" (lang-name language))))
 
-(defun make-language (name words)
+(defun make-language (name words family-str)
+  ;; Add words to a hash indexed by gloss for easy lookup
   (let ((words-hash (make-hash-table :test 'equal)))
     (dolist (word words)
       (setf (gethash (word-gloss word) words-hash) word))
     (make-instance 'language
                    :name name
-                   :words words-hash)))
+                   :words words-hash
+                   :family (mapcar #'str:trim
+                                   (str:split "," family-str)))))
 
 (defgeneric lang-word (language word-spec)
-  (:documentation "Get a WORD for the language by some identifier."))
-
-(defmethod lang-word ((language language) (gloss string))
-  "Get a word from LANGUAGE internal hash table by its English gloss."
-  (gethash gloss (slot-value language 'words)))
+  (:documentation "Get a WORD for the language by some identifier.")
+  (:method ((language language) (gloss string))
+    "Get a word from LANGUAGE internal hash table by its English gloss."
+    (gethash gloss (slot-value language 'words))))
 
 (defgeneric lang-words (language)
-  (:documentation "Get a sequence of all words for the language."))
+  (:documentation "Get a sequence of all words for the language.")
+  (:method ((language language))
+    (hash-table-values (slot-value language 'words))))
 
-(defmethod lang-words ((language language))
-  (hash-table-values (slot-value language 'words)))
+(defun lang-get-related (language level &key (lang-sequence nil))
+    "If LANG-SEQ is not specified, query the database for related languages.
+Otherwise, search for them in LANG-SEQ"
+    (let* ((subgroup   (lang-family language))
+           (parent     (subseq subgroup
+                             0 (- (length subgroup) level)))
+           (parent-str (str:join ", " parent)))
+      (format t "~a ~a ~a~&" subgroup parent parent-str)
+      (if lang-sequence
+          (remove-if-not (lambda (lang) (search parent (lang-family lang) :test #'string=))
+                         lang-sequence)
+          (get-languages `(:~ 'classification ,parent-str)))))
 
 (defclass word ()
   ((gloss :type 'string :initarg :gloss :accessor word-gloss)
@@ -113,11 +128,10 @@ by the English gloss for that word for easy lookup."))
   (make-instance 'word :gloss gloss :string string))
 
 (defgeneric word-distance (word-a word-b)
-  (:documentation "Calculate the difference between two WORDs by some measure."))
-
-(defmethod word-distance ((word-a word) (word-b word))
-  "Calculate Levenshtein distance between two words as strings."
-  (distance (word-string word-a) (word-string word-b)))
+  (:documentation "Calculate the difference between two WORDs by some measure.")
+  (:method ((word-a word) (word-b word))
+    "Calculate Levenshtein distance between two words as strings."
+    (distance (word-string word-a) (word-string word-b))))
 
 (defun get-languages (&optional (filter-expr nil) (params *db-parameters*))
   "Return an array of language objects constructed from database rows.
@@ -125,7 +139,9 @@ FILTER-EXPR should be an S-SQL :where clause - if nil, returns all
 languages."
   (let* ((filter-expr (if (null filter-expr) t filter-expr))
          (rows (with-connection params
-                 (query (sql-compile (append '(:select 'id 'language :from 'languages)
+                 (query (sql-compile (append '(:select
+                                               'id 'language 'classification
+                                               :from 'languages)
                                              `(:where ,filter-expr)))))))
     (flet ((retrieve-words (language-id)
              (query (:select 'glosses.name 'lexemes.transcript
@@ -138,11 +154,12 @@ languages."
                                         language-id)))))
     (lparallel:pmap 'vector
                     (lambda (row)
-                      (destructuring-bind (lang-id lang-name) row
+                      (destructuring-bind (lang-id lang-name lang-family) row
                         (make-language lang-name
                                        (mapcar (lambda (word-row) (apply #'make-word word-row))
                                                (with-connection params
-                                                 (retrieve-words lang-id))))))
+                                                 (retrieve-words lang-id)))
+                                       lang-family)))
                     rows))))
 
 (defun language-distance (a b)
@@ -180,7 +197,7 @@ hash table of language indices in one place"))
                              (aref items i) (aref items j)))))))
     (make-instance 'distance-matrix :index items :matrix matrix)))
 
-(defun vector->hash (vector &key (test #'=))
+(defun vector->hash (vector &key (test #'eq))
   "Convert a vector to a hash table with array positions as keys
 and contents as values."
   (let ((hash (make-hash-table :test test)))
@@ -199,11 +216,12 @@ Rather than resizing the matrix to remove rows/columns for clusterswhen a
 new cluster is created, the matrix is placed in the matrix position for the 
 left-hand cluster, and all the positions for the right-hand cluster are zeroed
 so MATRIX-MIN will ignore them."
-  (let ((cluster-indices (vector->hash (dm-index dm)))
+  (let ((n               (array-dimension (dm-matrix dm) 0))
+        (cluster-indices (vector->hash (dm-index dm)))
         (matrix          (alexandria:copy-array (dm-matrix dm))))
 
     (flet ((update-matrix (x y)
-             (dotimes (i (array-dimension matrix 0))
+             (dotimes (i n)
                (when  (/= i x y)
                  (let ((avg-distance (/ (+ (aref matrix x i)
                                            (aref matrix y i))
@@ -213,12 +231,12 @@ so MATRIX-MIN will ignore them."
              (setq-row matrix y 0)
              (setq-column matrix y 0)))
 
-      (loop until (= 1 (hash-table-count cluster-indices)) do
-           (multiple-value-bind (_ x y) (matrix-min matrix :threshold 0.01)
-             (setf (gethash x cluster-indices)
-                   (list (gethash y cluster-indices) (gethash x cluster-indices)))
-             (remhash y cluster-indices)
-             (update-matrix x y)))
+      (dotimes (i (1- n))
+        (multiple-value-bind (_ x y) (matrix-min matrix :threshold 0.01)
+          (setf (gethash x cluster-indices)
+                (list (gethash y cluster-indices) (gethash x cluster-indices)))
+          (remhash y cluster-indices)
+          (update-matrix x y)))
 
       (car (hash-table-values cluster-indices)))))
 
@@ -242,5 +260,3 @@ so MATRIX-MIN will ignore them."
                        (<= threshold el))
               (setf min el) (setf min-i i) (setf min-j j)))
      finally (return (values min min-i min-j))))
-           
-         
