@@ -113,8 +113,7 @@ Otherwise, search for them in LANG-SEQ"
     (let* ((subgroup   (lang-family language))
            (parent     (subseq subgroup
                              0 (- (length subgroup) level)))
-           (parent-str (str:join ", " parent)))
-      (format t "~a ~a ~a~&" subgroup parent parent-str)
+           (parent-str (str:join ", " parent))) ; Convert back to DB string format
       (if lang-sequence
           (remove-if-not (lambda (lang) (search parent (lang-family lang) :test #'string=))
                          lang-sequence)
@@ -132,6 +131,10 @@ Otherwise, search for them in LANG-SEQ"
   (:method ((word-a word) (word-b word))
     "Calculate Levenshtein distance between two words as strings."
     (distance (word-string word-a) (word-string word-b))))
+
+(defmethod print-object ((word word) stream)
+  (print-unreadable-object (word stream :type t)
+    (format stream "~s / ~s" (word-gloss word) (word-string word))))
 
 (defun get-languages (&optional (filter-expr nil) (params *db-parameters*))
   "Return an array of language objects constructed from database rows.
@@ -233,6 +236,7 @@ so MATRIX-MIN will ignore them."
 
       (dotimes (i (1- n))
         (multiple-value-bind (_ x y) (matrix-min matrix :threshold 0.01)
+          (declare (ignore _))
           (setf (gethash x cluster-indices)
                 (list (gethash y cluster-indices) (gethash x cluster-indices)))
           (remhash y cluster-indices)
